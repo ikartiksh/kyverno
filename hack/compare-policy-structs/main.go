@@ -10,7 +10,6 @@ import (
 )
 
 func main() {
-
 	v1Fields := getFieldSet("api/kyverno/v1/policy_types.go", "Policy")
 	v2beta1Fields := getFieldSet("api/kyverno/v2beta1/policy_types.go", "Policy")
 

@@ -12,7 +12,7 @@ func writeTempFile(t *testing.T, source string) string {
 	t.Helper()
 	dir := t.TempDir()
 	file := filepath.Join(dir, "temp.go")
-	require.NoError(t, os.WriteFile(file, []byte(source), 0644))
+	require.NoError(t, os.WriteFile(file, []byte(source), 0o644))
 	return file
 }
 
