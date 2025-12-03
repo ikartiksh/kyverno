@@ -7,6 +7,7 @@ import (
 
 	kyvernov1 "github.com/kyverno/kyverno/api/kyverno/v1"
 	kyvernov2 "github.com/kyverno/kyverno/api/kyverno/v2"
+	"github.com/kyverno/kyverno/api/policies.kyverno.io/v1beta1"
 	"github.com/kyverno/kyverno/pkg/background/common"
 	"github.com/kyverno/kyverno/pkg/breaker"
 	libs "github.com/kyverno/kyverno/pkg/cel/libs"
@@ -14,9 +15,13 @@ import (
 	"github.com/kyverno/kyverno/pkg/client/clientset/versioned"
 	"github.com/kyverno/kyverno/pkg/clients/dclient"
 	engineapi "github.com/kyverno/kyverno/pkg/engine/api"
+	event "github.com/kyverno/kyverno/pkg/event"
+	"github.com/kyverno/kyverno/pkg/policy"
 	reportutils "github.com/kyverno/kyverno/pkg/utils/report"
+	webhookutils "github.com/kyverno/kyverno/pkg/webhooks/utils"
 	"go.uber.org/multierr"
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -35,6 +40,7 @@ type processor struct {
 	statusControl common.StatusControlInterface
 
 	reportsConfig reportutils.ReportingConfiguration
+	eventGen      event.Interface
 }
 
 func NewProcessor(client dclient.Interface,
@@ -44,6 +50,7 @@ func NewProcessor(client dclient.Interface,
 	context libs.Context,
 	reportsConfig reportutils.ReportingConfiguration,
 	statusControl common.StatusControlInterface,
+	eventGen event.Interface,
 ) *processor {
 	return &processor{
 		client:        client,
@@ -53,24 +60,24 @@ func NewProcessor(client dclient.Interface,
 		context:       context,
 		statusControl: statusControl,
 		reportsConfig: reportsConfig,
+		eventGen:      eventGen,
 	}
 }
 
 func (p *processor) Process(ur *kyvernov2.UpdateRequest) error {
-	var failures []error
-	mpol, err := p.kyvernoClient.PoliciesV1alpha1().MutatingPolicies().Get(context.TODO(), ur.Spec.Policy, metav1.GetOptions{})
-	if err != nil {
-		failures = append(failures, fmt.Errorf("failed to fetch mpol %s: %v", ur.Spec.GetPolicyKey(), err))
-		return updateURStatus(p.statusControl, *ur, multierr.Combine(failures...), nil)
+	mpol, err := p.GetPolicy(ur)
+	if mpol == nil {
+		return err
 	}
 
-	targetConstraints := mpol.GetSpec().GetMatchConstraints()
-	if len(mpol.GetSpec().GetTargetMatchConstraints().ResourceRules) != 0 {
-		targetConstraints = mpol.GetSpec().GetTargetMatchConstraints()
+	var failures []error
+	targetConstraints := mpol.GetMatchConstraints()
+	if len(mpol.GetTargetMatchConstraints().ResourceRules) != 0 {
+		targetConstraints = mpol.GetTargetMatchConstraints()
 	}
 
 	var targets *unstructured.UnstructuredList
-	results := collectGVK(p.client, p.mapper, targetConstraints)
+	results := collectGVK(p.client, p.mapper, targetConstraints, mpol.GetNamespace())
 	for ns, gvks := range results {
 		for r := range gvks {
 			if r.Kind == "Namespace" || ns == "*" {
@@ -111,7 +118,7 @@ func (p *processor) Process(ur *kyvernov2.UpdateRequest) error {
 			nil,
 		)
 
-		response, err := p.engine.Evaluate(context.TODO(), attr, *ar, mpolengine.MatchNames(ur.Spec.Policy))
+		response, err := p.engine.Evaluate(context.TODO(), attr, *ar, mpolengine.And(mpolengine.MatchNames(ur.Spec.Policy), mpolengine.Or(mpolengine.ClusteredPolicy(), mpolengine.NamespacedPolicy(attr.GetNamespace()))))
 		if err != nil {
 			failures = append(failures, fmt.Errorf("failed to evaluate mpol %s: %v", ur.Spec.GetPolicyKey(), err))
 			continue
@@ -127,29 +134,40 @@ func (p *processor) Process(ur *kyvernov2.UpdateRequest) error {
 				failures = append(failures, fmt.Errorf("failed to update target resource for mpol %s: %v", ur.Spec.GetPolicyKey(), err))
 			}
 
-			if p.reportsConfig.MutateExistingReportsEnabled() {
-				err := p.createReports(object, &response)
-				if err != nil {
-					logger.Error(err, "failed to create reports for mpol", "mpol", ur.Spec.GetPolicyKey())
-				}
+			err := p.audit(object, &response)
+			if err != nil {
+				logger.Error(err, "failed to create reports for mpol", "mpol", ur.Spec.GetPolicyKey())
 			}
 		}
 	}
 	return updateURStatus(p.statusControl, *ur, multierr.Combine(failures...), nil)
 }
 
-func (p *processor) createReports(object *unstructured.Unstructured, response *mpolengine.EngineResponse) error {
-	engineResponses := make([]engineapi.EngineResponse, 0, len(response.Policies))
-	for _, res := range response.Policies {
-		engineResponses = append(engineResponses, engineapi.EngineResponse{
-			Resource: *response.PatchedResource,
+func (p *processor) audit(object *unstructured.Unstructured, response *mpolengine.EngineResponse) error {
+	allEngineResponses := make([]engineapi.EngineResponse, 0, len(response.Policies))
+	reportableEngineResponses := make([]engineapi.EngineResponse, 0, len(response.Policies))
+	for _, r := range response.Policies {
+		engineResponse := engineapi.EngineResponse{
+			Resource: *response.Resource,
 			PolicyResponse: engineapi.PolicyResponse{
-				Rules: res.Rules,
+				Rules: r.Rules,
 			},
-		}.WithPolicy(engineapi.NewMutatingPolicy(res.Policy)))
+		}
+		engineResponse = engineResponse.WithPolicy(engineapi.NewMutatingPolicyFromLike(r.Policy))
+		allEngineResponses = append(allEngineResponses, engineResponse)
+		if reportutils.IsPolicyReportable(r.Policy) {
+			reportableEngineResponses = append(reportableEngineResponses, engineResponse)
+		}
 	}
 
-	report := reportutils.BuildMutateExistingReport(object.GetNamespace(), object.GroupVersionKind(), object.GetName(), object.GetUID(), engineResponses...)
+	events := webhookutils.GenerateEvents(allEngineResponses, false)
+	p.eventGen.Add(events...)
+
+	if !p.reportsConfig.MutateExistingReportsEnabled() {
+		return nil
+	}
+
+	report := reportutils.BuildMutateExistingReport(object.GetNamespace(), object.GroupVersionKind(), object.GetName(), object.GetUID(), reportableEngineResponses...)
 	if len(report.GetResults()) > 0 {
 		err := breaker.GetReportsBreaker().Do(context.TODO(), func(ctx context.Context) error {
 			_, err := reportutils.CreateEphemeralReport(ctx, report, p.kyvernoClient)
@@ -162,7 +180,7 @@ func (p *processor) createReports(object *unstructured.Unstructured, response *m
 	return nil
 }
 
-func collectGVK(client dclient.Interface, mapper meta.RESTMapper, m admissionregistrationv1.MatchResources) map[string]sets.Set[schema.GroupVersionKind] {
+func collectGVK(client dclient.Interface, mapper meta.RESTMapper, m admissionregistrationv1.MatchResources, ns string) map[string]sets.Set[schema.GroupVersionKind] {
 	result := make(map[string]sets.Set[schema.GroupVersionKind])
 
 	gvkSet := sets.New[schema.GroupVersionKind]()
@@ -189,7 +207,14 @@ func collectGVK(client dclient.Interface, mapper meta.RESTMapper, m admissionreg
 		}
 	}
 
-	if m.NamespaceSelector != nil {
+	if ns != "" {
+		namespace, err := client.GetResource(context.TODO(), "v1", "Namespace", "", ns)
+		if err != nil {
+			return result
+		}
+		result[namespace.GetName()] = gvkSet
+		return result
+	} else if m.NamespaceSelector != nil {
 		namespaces, err := client.ListResource(context.TODO(), "v1", "Namespace", "", m.NamespaceSelector)
 		if err != nil {
 			return result
@@ -215,4 +240,27 @@ func updateURStatus(statusControl common.StatusControlInterface, ur kyvernov2.Up
 		}
 	}
 	return nil
+}
+
+func (p *processor) GetPolicy(ur *kyvernov2.UpdateRequest) (v1beta1.MutatingPolicyLike, error) {
+	var mpol v1beta1.MutatingPolicyLike
+	var err error
+
+	var failures []error
+	mpol, err = p.kyvernoClient.PoliciesV1beta1().MutatingPolicies().Get(context.TODO(), ur.Spec.Policy, metav1.GetOptions{})
+	if err == nil {
+		return mpol, nil
+	}
+
+	// Try NamespacedMutatingPolicy
+	if errors.IsNotFound(err) {
+		name, ns := policy.ParsePolicyKey(ur.Spec.Policy)
+		mpol, err = p.kyvernoClient.PoliciesV1beta1().NamespacedMutatingPolicies(ns).Get(context.TODO(), name, metav1.GetOptions{})
+		if err == nil {
+			return mpol, nil
+		}
+	}
+
+	failures = append(failures, fmt.Errorf("failed to fetch mpol %s: %v", ur.Spec.GetPolicyKey(), err))
+	return nil, updateURStatus(p.statusControl, *ur, multierr.Combine(failures...), nil)
 }
